@@ -1064,8 +1064,10 @@ class TableWalker : public ClockedObject
         statistics::Scalar walks;
         statistics::Scalar walksShortDescriptor;
         statistics::Scalar walksLongDescriptor;
+        statistics::Scalar walksLongWalkerMiss;
         statistics::Vector walksShortTerminatedAtLevel;
         statistics::Vector walksLongTerminatedAtLevel;
+        statistics::Vector walksLongWalkerStartedAtLevel;
         statistics::Scalar squashedBefore;
         statistics::Scalar squashedAfter;
         statistics::Histogram walkWaitTime;

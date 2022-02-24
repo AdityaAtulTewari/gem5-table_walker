@@ -1219,6 +1219,9 @@ TableWalker::walkAddresses(Addr ttbr, GrainSize tg, int tsz, int pa_range)
         panic_if(first_level == LookupLevel::Num_ArmLookupLevel,
                  "Table walker couldn't find lookup level\n");
 
+        /* Count Walker Cache misses */
+        ++stats.walksLongWalkerMiss;
+
         int stride = tg - 3;
         int base_addr_lo = 3 + tsz - stride * (3 - first_level) - tg;
 
@@ -1230,6 +1233,10 @@ TableWalker::walkAddresses(Addr ttbr, GrainSize tg, int tsz, int pa_range)
             table_addr = mbits(ttbr, 47, base_addr_lo);
         }
     }
+
+    /* This finds out where the partial walks start from */
+    if (first_level < LookupLevel::Num_ArmLookupLevel)
+      ++stats.walksLongWalkerStartedAtLevel[(unsigned) first_level];
 
     desc_addr = table_addr + ptops->index(currState->vaddr, first_level, tsz);
 
@@ -2597,7 +2604,11 @@ TableWalker::TableWalkerStats::TableWalkerStats(statistics::Group *parent)
     ADD_STAT(pageSizes, statistics::units::Count::get(),
              "Table walker page sizes translated"),
     ADD_STAT(requestOrigin, statistics::units::Count::get(),
-             "Table walker requests started/completed, data/inst")
+             "Table walker requests started/completed, data/inst"),
+    ADD_STAT(walksLongWalkerMiss, statistics::units::Count::get(),
+             "Table walker cache misses"),
+    ADD_STAT(walksLongWalkerStartedAtLevel, statistics::units::Count::get(),
+             "Table walker cache misses started at each  level")
 {
     walksShortDescriptor
         .flags(statistics::nozero);
@@ -2619,6 +2630,17 @@ TableWalker::TableWalkerStats::TableWalkerStats(statistics::Group *parent)
     walksLongTerminatedAtLevel.subname(1, "Level1");
     walksLongTerminatedAtLevel.subname(2, "Level2");
     walksLongTerminatedAtLevel.subname(3, "Level3");
+
+    walksLongWalkerMiss
+        .flags(statistics::nozero);
+
+    walksLongWalkerStartedAtLevel
+        .init(4)
+        .flags(statistics::nozero);
+    walksLongWalkerStartedAtLevel.subname(0, "Level0");
+    walksLongWalkerStartedAtLevel.subname(1, "Level1");
+    walksLongWalkerStartedAtLevel.subname(2, "Level2");
+    walksLongWalkerStartedAtLevel.subname(3, "Level3");
 
     squashedBefore
         .flags(statistics::nozero);
