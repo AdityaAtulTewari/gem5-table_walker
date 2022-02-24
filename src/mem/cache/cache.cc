@@ -953,8 +953,8 @@ Cache::doTimingSupplyResponse(PacketPtr req_pkt, const uint8_t *blk_data,
         // responses)
         pkt = new Packet(req_pkt, false, req_pkt->isRead());
 
-    assert(req_pkt->req->isUncacheable() || req_pkt->isInvalidate() ||
-           pkt->hasSharers());
+    /*assert(req_pkt->req->isUncacheable() || req_pkt->isInvalidate() ||
+           pkt->hasSharers());*/
     pkt->makeTimingResponse();
     if (pkt->isRead()) {
         pkt->setDataFromBlock(blk_data, blkSize);
