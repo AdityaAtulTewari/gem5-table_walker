@@ -100,6 +100,64 @@ TableWalker::~TableWalker()
     ;
 }
 
+uint32_t TableWalker::computeIndex(
+    std::vector<TableWalker::WhereWalker> walkAccess)
+{
+  assert(walkAccess.size() == 4);
+  uint32_t ret = 0;
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    ret *= NUMTYP;
+    auto elem = walkAccess[i];
+    assert(elem < NUMTYP && elem > UNKNOW);
+    ret += elem;
+  }
+  return ret;
+}
+
+std::vector<TableWalker::WhereWalker>
+TableWalker::computeWalkerVector(uint32_t index)
+{
+  std::vector<WhereWalker> ret = std::vector<WhereWalker>();
+  for (int i = 3; i >= 0; i--)
+  {
+    WhereWalker elem = (WhereWalker)((index >> (2*i)) & 0x3);
+    assert(elem < NUMTYP && elem > UNKNOW);
+    ret.emplace_back(elem);
+  }
+  return ret;
+}
+
+char TableWalker::toCharWalker(TableWalker::WhereWalker w)
+{
+  switch(w)
+  {
+    case UNKNOW:
+      return 'U';
+    case WFAULT:
+      return 'F';
+    case WCACHE:
+      return 'W';
+    case MCACHE:
+      return 'C';
+    case MEMORY:
+      return 'M';
+    default:
+      panic("It appears the CharWalker has failed at %d", w);
+  }
+}
+
+std::string TableWalker::toStringWalker(
+    std::vector<TableWalker::WhereWalker> v)
+{
+  std::string ret = "";
+  for (auto it = v.begin(); it < v.end(); it++)
+  {
+    ret += toCharWalker(*it);
+  }
+  return ret;
+}
+
 TableWalker::Port &
 TableWalker::getTableWalkerPort()
 {
@@ -150,7 +208,8 @@ PacketPtr
 TableWalker::Port::createPacket(
     Addr desc_addr, int size,
     uint8_t *data, Request::Flags flags, Tick delay,
-    Event *event)
+    Event *event,
+    std::function<void(const Packet&)> after)
 {
     RequestPtr req = std::make_shared<Request>(
         desc_addr, size, flags, requestorId);
@@ -162,6 +221,7 @@ TableWalker::Port::createPacket(
     auto state = new TableWalkerState;
     state->event = event;
     state->delay = delay;
+    state->close = after;
 
     pkt->senderState = state;
     return pkt;
@@ -195,9 +255,10 @@ void
 TableWalker::Port::sendTimingReq(
     Addr desc_addr, int size,
     uint8_t *data, Request::Flags flags, Tick delay,
-    Event *event)
+    Event *event,
+    std::function<void(const Packet&)> after)
 {
-    auto pkt = createPacket(desc_addr, size, data, flags, delay, event);
+    auto pkt = createPacket(desc_addr, size, data, flags, delay, event, after);
 
     schedTimingReq(pkt, curTick());
 }
@@ -223,6 +284,7 @@ TableWalker::Port::handleRespPacket(PacketPtr pkt, Tick delay)
     // Get the DMA sender state.
     auto *state = dynamic_cast<TableWalkerState*>(pkt->senderState);
     assert(state);
+    state->close(*pkt);
 
     handleResp(state, pkt->getAddr(), pkt->req->getSize(), delay);
 
@@ -284,6 +346,7 @@ TableWalker::drainResume()
         pendingChange();
     }
 }
+
 
 Fault
 TableWalker::walk(const RequestPtr &_req, ThreadContext *_tc, uint16_t _asid,
@@ -1108,6 +1171,12 @@ TableWalker::processWalkAArch64()
         currState->physAddrRange = pa_range;
     }
 
+    if (currState->walkDistr.find(currState->vaddr_tainted) ==
+        currState->walkDistr.end())
+    {
+      currState->walkDistr[currState->vaddr_tainted] =
+        std::vector<WhereWalker>(4, UNKNOW);
+    }
     auto [table_addr, desc_addr, start_lookup_level] = walkAddresses(
         ttbr, tg, tsz, pa_range);
 
@@ -1136,6 +1205,11 @@ TableWalker::processWalkAArch64()
             pending = false;
             nextWalk(currState->tc);
             currState = NULL;
+            for (uint8_t l = start_lookup_level;
+                l < LookupLevel::Num_ArmLookupLevel; l++)
+              currState->walkDistr[currState->vaddr_tainted][l] = WFAULT;
+            stats.walksLongWalkDistr[computeIndex(
+                currState->walkDistr[currState->vaddr_tainted])]++;
         } else {
             currState->tc = NULL;
             currState->req = NULL;
@@ -1153,6 +1227,11 @@ TableWalker::processWalkAArch64()
             pending = false;
             nextWalk(currState->tc);
             currState = NULL;
+            for (uint8_t l = start_lookup_level;
+                l < LookupLevel::Num_ArmLookupLevel; l++)
+              currState->walkDistr[currState->vaddr_tainted][l] = WFAULT;
+            stats.walksLongWalkDistr[computeIndex(
+                currState->walkDistr[currState->vaddr_tainted])]++;
         } else {
             currState->tc = NULL;
             currState->req = NULL;
@@ -1175,9 +1254,23 @@ TableWalker::processWalkAArch64()
     currState->longDesc.physAddrRange = _physAddrRange;
 
     if (currState->timing) {
+        auto L = start_lookup_level;
+        WhereWalker& map_loc =
+          currState->walkDistr[currState->vaddr_tainted][L];
+        std::function<void(const Packet&)> after =
+           [L, &map_loc, this](const Packet& pkt){
+          this->stats.walksLongWalkerLevelFullfilled[L]
+            [pkt.req->getAccessDepth() + 1]++;
+          pkt.req->setAccessLatency();
+          this->stats.walksLongWalkDistrLat[
+            pkt.req->getAccessDepth() + 1] += pkt.req->getAccessLatency();
+          if (pkt.req->getAccessDepth() < 1) map_loc = MCACHE;
+          else if (pkt.req->getAccessDepth() >= 1) map_loc = MEMORY;
+        };
+
         fetchDescriptor(desc_addr, (uint8_t*) &currState->longDesc.data,
                         sizeof(uint64_t), flag, start_lookup_level,
-                        LongDescEventByLevel[start_lookup_level], NULL);
+                        LongDescEventByLevel[start_lookup_level], NULL, after);
     } else {
         fetchDescriptor(desc_addr, (uint8_t*)&currState->longDesc.data,
                         sizeof(uint64_t), flag, -1, NULL,
@@ -1211,6 +1304,8 @@ TableWalker::walkAddresses(Addr ttbr, GrainSize tg, int tsz, int pa_range)
 
         table_addr = entry->pfn;
         first_level = (LookupLevel)(entry->lookupLevel + 1);
+        for (uint8_t l = LookupLevel::L0; l < first_level; l++)
+          currState->walkDistr[currState->vaddr_tainted][l] = WCACHE;
     } else {
         // WalkCache miss
         first_level = isStage2 ?
@@ -1235,7 +1330,7 @@ TableWalker::walkAddresses(Addr ttbr, GrainSize tg, int tsz, int pa_range)
     }
 
     /* This finds out where the partial walks start from */
-    if (first_level < LookupLevel::Num_ArmLookupLevel)
+    if (first_level != LookupLevel::Num_ArmLookupLevel)
       ++stats.walksLongWalkerStartedAtLevel[(unsigned) first_level];
 
     desc_addr = table_addr + ptops->index(currState->vaddr, first_level, tsz);
@@ -1805,6 +1900,7 @@ TableWalker::generateLongDescFault(ArmFault::FaultSource src)
 void
 TableWalker::doLongDescriptor()
 {
+
     if (currState->fault != NoFault) {
         return;
     }
@@ -1954,9 +2050,22 @@ TableWalker::doLongDescriptor()
             }
 
             bool delayed;
-            delayed = fetchDescriptor(next_desc_addr, (uint8_t*)&currState->longDesc.data,
+            WhereWalker& map_loc =
+              currState->walkDistr[currState->vaddr_tainted][L];
+            std::function<void(const Packet&)> after =
+              [L, &map_loc, this](const Packet& pkt){
+              this->stats.walksLongWalkerLevelFullfilled[L][
+                pkt.req->getAccessDepth() + 1]++;
+              pkt.req->setAccessLatency();
+              this->stats.walksLongWalkDistrLat[
+                pkt.req->getAccessDepth() + 1] += pkt.req->getAccessLatency();
+              if (pkt.req->getAccessDepth() < 1) map_loc = MCACHE;
+              else if (pkt.req->getAccessDepth() >= 1) map_loc = MEMORY;
+            };
+            delayed = fetchDescriptor(next_desc_addr,
+                                      (uint8_t*)&currState->longDesc.data,
                                       sizeof(uint64_t), flag, -1, event,
-                                      &TableWalker::doLongDescriptor);
+                                      &TableWalker::doLongDescriptor, after);
             if (delayed) {
                  currState->delayed = true;
             }
@@ -2168,6 +2277,14 @@ TableWalker::doLongDescriptorWrapper(LookupLevel curr_lookup_level)
 
     DPRINTF(PageTableWalker, "calling doLongDescriptor for vaddr:%#x\n",
             currState->vaddr_tainted);
+
+    if (currState->walkDistr.find(currState->vaddr_tainted) ==
+        currState->walkDistr.end())
+    {
+      currState->walkDistr[currState->vaddr_tainted] =
+        std::vector<WhereWalker>(4, UNKNOW);
+    }
+
     doLongDescriptor();
 
     stateQueues[curr_lookup_level].pop_front();
@@ -2183,6 +2300,11 @@ TableWalker::doLongDescriptorWrapper(LookupLevel curr_lookup_level)
         currState->req = NULL;
         currState->tc = NULL;
         currState->delayed = false;
+        for (uint8_t l = currState->longDesc.lookupLevel;
+            l < LookupLevel::Num_ArmLookupLevel; l++)
+          currState->walkDistr[currState->vaddr_tainted][l] = WFAULT;
+        stats.walksLongWalkDistr[computeIndex(
+            currState->walkDistr[currState->vaddr_tainted])]++;
         delete currState;
     } else if (!currState->delayed) {
         // No additional lookups required
@@ -2201,6 +2323,9 @@ TableWalker::doLongDescriptorWrapper(LookupLevel curr_lookup_level)
         currState->req = NULL;
         currState->tc = NULL;
         currState->delayed = false;
+        if (curr_lookup_level == LookupLevel::L3)
+          stats.walksLongWalkDistr[computeIndex(
+              currState->walkDistr[currState->vaddr_tainted])]++;
         delete currState;
     } else {
         if (curr_lookup_level >= LookupLevel::Num_ArmLookupLevel - 1)
@@ -2224,7 +2349,8 @@ TableWalker::nextWalk(ThreadContext *tc)
 bool
 TableWalker::fetchDescriptor(Addr descAddr, uint8_t *data, int numBytes,
     Request::Flags flags, int queueIndex, Event *event,
-    void (TableWalker::*doDescriptor)())
+    void (TableWalker::*doDescriptor)(),
+    std::function<void(const Packet&)> after)
 {
     bool isTiming = currState->timing;
 
@@ -2270,7 +2396,7 @@ TableWalker::fetchDescriptor(Addr descAddr, uint8_t *data, int numBytes,
     } else {
         if (isTiming) {
             port->sendTimingReq(descAddr, numBytes, data, flags,
-                currState->tc->getCpuPtr()->clockPeriod(), event);
+                currState->tc->getCpuPtr()->clockPeriod(), event, after);
 
             if (queueIndex >= 0) {
                 DPRINTF(PageTableWalker, "Adding to walker fifo: "
@@ -2577,6 +2703,7 @@ TableWalker::Stage2Walk::translateTiming(ThreadContext *tc)
     parent.mmu->translateTiming(req, tc, this, mode, tranType, true);
 }
 
+
 TableWalker::TableWalkerStats::TableWalkerStats(statistics::Group *parent)
     : statistics::Group(parent),
     ADD_STAT(walks, statistics::units::Count::get(),
@@ -2603,12 +2730,18 @@ TableWalker::TableWalkerStats::TableWalkerStats(statistics::Group *parent)
              "Table walker pending requests distribution"),
     ADD_STAT(pageSizes, statistics::units::Count::get(),
              "Table walker page sizes translated"),
-    ADD_STAT(requestOrigin, statistics::units::Count::get(),
-             "Table walker requests started/completed, data/inst"),
     ADD_STAT(walksLongWalkerMiss, statistics::units::Count::get(),
              "Table walker cache misses"),
     ADD_STAT(walksLongWalkerStartedAtLevel, statistics::units::Count::get(),
-             "Table walker cache misses started at each  level")
+             "Table walker cache misses started at each  level"),
+    ADD_STAT(requestOrigin, statistics::units::Count::get(),
+             "Table walker requests started/completed, data/inst"),
+    ADD_STAT(walksLongWalkerLevelFullfilled, statistics::units::Count::get(),
+             "Where are Long Walk TLB misses fullfilled?"),
+    ADD_STAT(walksLongWalkDistr, statistics::units::Count::get(),
+             "What is the Distribution of walk parts?"),
+    ADD_STAT(walksLongWalkDistrLat, statistics::units::Tick::get(),
+             "What is the Latency distribution?")
 {
     walksShortDescriptor
         .flags(statistics::nozero);
@@ -2683,6 +2816,39 @@ TableWalker::TableWalkerStats::TableWalkerStats(statistics::Group *parent)
     requestOrigin.subname(1,"Completed");
     requestOrigin.ysubname(0,"Data");
     requestOrigin.ysubname(1,"Inst");
+
+    /** Cap the memory hierarchy at 6 objects **/
+    walksLongWalkerLevelFullfilled
+        .init(5,6)
+        .flags(statistics::nozero);
+    walksLongWalkerLevelFullfilled.subname(0, "Level0");
+    walksLongWalkerLevelFullfilled.subname(1, "Level1");
+    walksLongWalkerLevelFullfilled.subname(2, "Level2");
+    walksLongWalkerLevelFullfilled.subname(3, "Level3");
+    walksLongWalkerLevelFullfilled.subname(4, "LevelP");
+    walksLongWalkerLevelFullfilled.ysubname(0, "L1");
+    walksLongWalkerLevelFullfilled.ysubname(1, "L2");
+    walksLongWalkerLevelFullfilled.ysubname(2, "L3_Memory");
+    walksLongWalkerLevelFullfilled.ysubname(3, "L4_Memory");
+    walksLongWalkerLevelFullfilled.ysubname(4, "L5_Memory");
+    walksLongWalkerLevelFullfilled.ysubname(5, "L6_Memory");
+
+    walksLongWalkDistrLat
+        .init(6)
+        .flags(statistics::nozero);
+    walksLongWalkDistrLat.subname(0, "L1");
+    walksLongWalkDistrLat.subname(1, "L2");
+    walksLongWalkDistrLat.subname(2, "L3_Memory");
+    walksLongWalkDistrLat.subname(3, "L4_Memory");
+    walksLongWalkDistrLat.subname(4, "L5_Memory");
+    walksLongWalkDistrLat.subname(5, "L6_Memory");
+
+    /** Distribution of the memory hierarchy **/
+    walksLongWalkDistr.init(256).flags(statistics::nozero);
+    for (uint32_t i = 0; i < 256; i++)
+    {
+      walksLongWalkDistr.subname(i, toStringWalker(computeWalkerVector(i)));
+    }
 }
 
 } // namespace gem5

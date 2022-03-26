@@ -38,7 +38,9 @@
 #ifndef __ARCH_ARM_TABLE_WALKER_HH__
 #define __ARCH_ARM_TABLE_WALKER_HH__
 
+#include <functional>
 #include <list>
+#include <vector>
 
 #include "arch/arm/faults.hh"
 #include "arch/arm/mmu.hh"
@@ -68,6 +70,22 @@ class TableWalker : public ClockedObject
     using LookupLevel = enums::ArmLookupLevel;
 
   public:
+    enum WhereWalker : int8_t
+    {
+      UNKNOW = -1,
+      WFAULT = 0,
+      WCACHE = 1,
+      MCACHE = 2,
+      MEMORY = 3,
+      NUMTYP = 4
+    };
+
+    static uint32_t computeIndex(std::vector<WhereWalker> walkAccess);
+    static std::vector<WhereWalker> computeWalkerVector(uint32_t index);
+    static char toCharWalker(WhereWalker w);
+    static std::string toStringWalker(std::vector<WhereWalker> v);
+
+
     class WalkerState;
 
     class DescriptorBase
@@ -799,6 +817,7 @@ class TableWalker : public ClockedObject
     class WalkerState
     {
       public:
+        std::unordered_map<Addr, std::vector<WhereWalker>> walkDistr;
         /** Thread context that we're doing the walk for */
         ThreadContext *tc;
 
@@ -934,6 +953,7 @@ class TableWalker : public ClockedObject
       public:
         Tick delay = 0;
         Event *event = nullptr;
+        std::function<void(const Packet&)> close = [](const Packet& pkt){};
     };
 
     class Port : public QueuedRequestPort
@@ -947,7 +967,8 @@ class TableWalker : public ClockedObject
             uint8_t *data, Request::Flags flag, Tick delay);
         void sendTimingReq(Addr desc_addr, int size,
             uint8_t *data, Request::Flags flag, Tick delay,
-            Event *event);
+            Event *event, std::function<void(const Packet&)> after =
+            [](const Packet& pkt){});
 
         bool recvTimingResp(PacketPtr pkt) override;
 
@@ -958,7 +979,9 @@ class TableWalker : public ClockedObject
 
         PacketPtr createPacket(Addr desc_addr, int size,
                                uint8_t *data, Request::Flags flag,
-                               Tick delay, Event *event);
+                               Tick delay, Event *event,
+                               std::function<void(const Packet&)> after =
+                               [](const Packet& pkt){});
 
       private:
         /** Packet queue used to store outgoing requests. */
@@ -1076,6 +1099,9 @@ class TableWalker : public ClockedObject
         statistics::Histogram pendingWalks;
         statistics::Vector pageSizes;
         statistics::Vector2d requestOrigin;
+        statistics::Vector2d walksLongWalkerLevelFullfilled;
+        statistics::Vector walksLongWalkDistr;
+        statistics::Vector walksLongWalkDistrLat;
     } stats;
 
     mutable unsigned pendingReqs;
@@ -1146,7 +1172,8 @@ class TableWalker : public ClockedObject
 
     bool fetchDescriptor(Addr descAddr, uint8_t *data, int numBytes,
         Request::Flags flags, int queueIndex, Event *event,
-        void (TableWalker::*doDescriptor)());
+        void (TableWalker::*doDescriptor)(),
+        std::function<void(const Packet&)>  f = [](const Packet& pkt){});
 
     Fault generateLongDescFault(ArmFault::FaultSource src);
 
